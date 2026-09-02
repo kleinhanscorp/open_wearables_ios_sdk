@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased — Gutsy fork (`kleinhanscorp/open_wearables_ios_sdk`), on top of 0.14.0
+
+* **Refresh-rotation lockout closed** (upstream #1379 / ios#40). The server revokes the presented refresh token the moment it answers 200; if the process is suspended before the new pair is persisted, the device is locked out forever. Now: the rotated pair is persisted **refresh-token-first and read-back-verified** before any retry; Keychain writes are **atomic upserts** (`SecItemUpdate`, add only when absent) instead of delete-then-add; a rejected refresh **re-reads the Keychain** and adopts a newer pair if a concurrent writer already installed one.
+* **Native renewal (JS-free self-heal)**: `setRenewalCredential(url:token:)` installs a long-lived, non-rotating credential the SDK exchanges for a fresh pair when refresh is rejected — single-flight, 60 s spacing, two-strike cutoff. `clearRenewalCredential()`, `hasRenewalCredential`.
+* **Sticky auth ledger**: `authState` (`ok` / `recovering` / `reauth_required`), `getAuthState()`, and two new callbacks `onAuthStateChanged` / `onAuthRecovered`. `onAuthError` now fires only after the ladder is exhausted and the verdict is already persisted for the next launch.
+* **`ensureFreshSession(completion:)`**: the host-safe session probe — refreshes proactively when the access token expires within 5 minutes and walks the ladder on rejection. Hosts never touch refresh tokens.
+* **Sign-out revokes** the refresh token server-side, best-effort (ios#39).
+
 ## 0.14.0
 
 * **Fixed full export poisoning**: when the first upload of a full export failed (offline, backend down, app killed), subsequent triggers overwrote the session as incremental without anchors — causing an infinite re-upload loop of old data. Full-export mode is now sticky until completed; already-poisoned devices self-heal.

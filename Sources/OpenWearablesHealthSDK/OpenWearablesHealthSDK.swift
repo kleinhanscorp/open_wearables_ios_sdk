@@ -53,7 +53,16 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     /// Called when an authentication error occurs (e.g., 401 Unauthorized).
     /// Parameters: (statusCode: Int, message: String)
+    /// Gutsy fork: fires only after the SDK's own recovery ladder (double-check → renewal) is
+    /// exhausted — see `Internal/AuthRecovery.swift`.
     public var onAuthError: ((Int, String) -> Void)?
+
+    /// Gutsy fork: the persisted auth verdict changed. Parameter: `OWAuthState.rawValue`.
+    public var onAuthStateChanged: ((String) -> Void)?
+
+    /// Gutsy fork: a broken session was repaired. Parameter: the path that repaired it
+    /// ("renewal", "double-check", "external").
+    public var onAuthRecovered: ((String) -> Void)?
 
     // MARK: - Configuration State
     internal var host: String?
@@ -68,6 +77,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private var isRefreshingToken = false
     private let tokenRefreshLock = NSLock()
     private var tokenRefreshCallbacks: [(TokenRefreshResult) -> Void] = []
+
+    // Renewal single-flight state (Gutsy fork — used by Internal/AuthRecovery.swift)
+    internal var isRenewing = false
+    internal let renewalLock = NSLock()
+    internal var renewalCallbacks: [(RenewalOutcome) -> Void] = []
     
     // MARK: - Auth Helpers
     
@@ -256,22 +270,29 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         clearSyncSession()
         resetAllAnchors()
         clearOutbox()
-        
+
+        // A fresh sign-in supersedes any renewal credential and any prior verdict.
+        OpenWearablesHealthSdkKeychain.clearRenewalCredential()
+        resetAuthLedger()
+
         OpenWearablesHealthSdkKeychain.saveCredentials(userId: userId, accessToken: accessToken, refreshToken: refreshToken)
-        
+
         if let apiKey = apiKey {
             OpenWearablesHealthSdkKeychain.saveApiKey(apiKey)
             logMessage("API key saved")
         }
-        
+
         let authMode = hasTokens ? "token" : "apiKey"
         logMessage("Signed in: userId=\(userId), mode=\(authMode)")
     }
-    
+
     /// Sign out - cancels sync, clears all state.
     public func signOut() {
         logMessage("Signing out")
-        
+
+        // Before the Keychain is wiped: tell the server this refresh token is done (fire-and-forget).
+        revokeRefreshTokenBestEffort()
+
         cancelSync()
         stopBackgroundDelivery()
         stopNetworkMonitoring()
@@ -287,9 +308,12 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     }
     
     /// Update tokens (e.g., after external token refresh).
+    /// Gutsy fork: also lifts any `recovering` / `reauthRequired` verdict — the host has repaired us.
     public func updateTokens(accessToken: String, refreshToken: String?) {
-        OpenWearablesHealthSdkKeychain.updateTokens(accessToken: accessToken, refreshToken: refreshToken)
-        logMessage("Tokens updated")
+        let persisted = OpenWearablesHealthSdkKeychain.updateTokens(accessToken: accessToken, refreshToken: refreshToken)
+        logMessage(persisted ? "Tokens updated" : "Tokens updated but Keychain verification failed")
+        OpenWearablesHealthSdkKeychain.setRenewalFailures(0)
+        markAuthOk(via: "external")
         retryOutboxIfPossible()
     }
     
@@ -450,7 +474,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             "refreshToken": OpenWearablesHealthSdkKeychain.getRefreshToken(),
             "apiKey": OpenWearablesHealthSdkKeychain.getApiKey(),
             "host": OpenWearablesHealthSdkKeychain.getHost(),
-            "isSyncActive": OpenWearablesHealthSdkKeychain.isSyncActive()
+            "isSyncActive": OpenWearablesHealthSdkKeychain.isSyncActive(),
+            "authState": authState.rawValue,
+            "hasRenewalCredential": hasRenewalCredential
         ]
     }
     
@@ -1224,17 +1250,27 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             return
         }
         
-        guard let refreshToken = self.refreshToken, let base = self.apiBaseUrl else {
+        guard let base = self.apiBaseUrl else {
             tokenRefreshLock.unlock()
-            logMessage("Token refresh failed: no credentials")
-            completion(.authFailure)
+            logMessage("Token refresh failed: not configured")
+            completion(.networkError)
             return
         }
-        
+
         isRefreshingToken = true
         tokenRefreshCallbacks.append(completion)
         tokenRefreshLock.unlock()
-        
+
+        guard let refreshToken = self.refreshToken else {
+            // No refresh token at all (a lost write, a partial sign-in). Not necessarily fatal:
+            // the renewal ladder can still mint a pair. Runs under the single-flight claim.
+            logMessage("Token refresh: no refresh token - trying recovery")
+            resolveRefreshRejection(presentedRefreshToken: nil) { [weak self] result in
+                self?.finishTokenRefresh(result: result)
+            }
+            return
+        }
+
         guard let url = URL(string: "\(base)/token/refresh") else {
             logMessage("Token refresh failed: invalid URL")
             finishTokenRefresh(result: .authFailure)
@@ -1265,8 +1301,14 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             
             if (401...403).contains(statusCode) {
-                self.logMessage("Token refresh rejected: HTTP \(statusCode)")
-                self.finishTokenRefresh(result: .authFailure)
+                // The presented token is revoked (rotation) or unknown. Not the end: a newer pair
+                // may already be installed, and the renewal credential can mint one. The recovery
+                // runs while this call still holds the single-flight claim, so no second refresh
+                // can race it (open_wearables_ios_sdk#40).
+                self.logMessage("Token refresh rejected: HTTP \(statusCode) - starting recovery")
+                self.resolveRefreshRejection(presentedRefreshToken: refreshToken) { [weak self] result in
+                    self?.finishTokenRefresh(result: result)
+                }
                 return
             }
             
@@ -1286,11 +1328,19 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
             
             let newRefreshToken = json["refresh_token"] as? String
-            OpenWearablesHealthSdkKeychain.updateTokens(accessToken: newAccessToken, refreshToken: newRefreshToken)
+            // The server has ALREADY revoked the token we presented. Persist the new pair (refresh
+            // token first, verified) BEFORE anyone is told to retry with it.
+            let persisted = OpenWearablesHealthSdkKeychain.updateTokens(accessToken: newAccessToken, refreshToken: newRefreshToken)
+            if !persisted {
+                self.logMessage("Token refresh: HTTP \(statusCode) but the pair did not persist - treating as transient")
+                self.finishTokenRefresh(result: .networkError)
+                return
+            }
             self.logMessage("Token refresh: HTTP \(statusCode)")
+            self.markAuthOk(via: "refresh")
             self.finishTokenRefresh(result: .success)
         }
-        
+
         task.resume()
     }
     
@@ -1310,6 +1360,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     
     internal func emitAuthError(statusCode: Int) {
         logMessage("Auth error: HTTP \(statusCode) - token invalid")
+        // Persist the verdict FIRST: the host may not be alive to receive the callback, but it
+        // will read `getAuthState()` at its next launch.
+        markReauthRequired()
         onAuthError?(statusCode, "Unauthorized - please re-authenticate")
     }
     
