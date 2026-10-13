@@ -107,7 +107,11 @@ extension OpenWearablesHealthSDK {
     ///
     /// Completion values: `"ok"` (nothing to do) · `"refreshed"` · `"recovered"` (via renewal) ·
     /// `"reauth_required"` · `"network_error"` · `"no_session"` · `"api_key"`.
-    public func ensureFreshSession(completion: @escaping (String) -> Void) {
+    public func ensureFreshSession(expectedGeneration: String? = nil, completion: @escaping (String) -> Void) {
+        OpenWearablesHealthSdkKeychain.connectionLock.lock()
+        defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+        let owner = OpenWearablesHealthSdkKeychain.connectionOwner()
+        guard expectedGeneration == nil || expectedGeneration == owner.generation else { completion("network_error"); return }
         guard userId != nil, hasAuth else {
             completion("no_session")
             return
@@ -126,6 +130,7 @@ extension OpenWearablesHealthSDK {
         let recoveredBefore = OpenWearablesHealthSdkKeychain.getLastRecoveredAt()
         attemptTokenRefresh { [weak self] result in
             guard let self = self else { completion("network_error"); return }
+            guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { completion("network_error"); return }
             switch result {
             case .success:
                 let recoveredAfter = OpenWearablesHealthSdkKeychain.getLastRecoveredAt()
