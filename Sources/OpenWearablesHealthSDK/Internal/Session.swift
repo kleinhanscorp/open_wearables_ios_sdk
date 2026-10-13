@@ -15,6 +15,8 @@ struct SyncState: Codable {
     let userKey: String
     let fullExport: Bool
     let createdAt: Date
+    var connectionGeneration: String? = nil
+    var syncSessionId: String? = nil
     
     var typeProgress: [String: TypeSyncProgress]
     var totalSentCount: Int
@@ -50,6 +52,8 @@ extension OpenWearablesHealthSDK {
     // MARK: - Save/Load Sync State
     
     internal func saveSyncState(_ state: SyncState) {
+        guard state.userKey == userKey(),
+              state.connectionGeneration == OpenWearablesHealthSdkKeychain.connectionGeneration() else { return }
         ensureSyncStateDir()
         if let data = try? JSONEncoder().encode(state) {
             try? data.write(to: syncStateFilePath(), options: .atomic)
@@ -62,7 +66,9 @@ extension OpenWearablesHealthSDK {
             return nil
         }
         
-        guard state.userKey == userKey() else {
+        guard state.userKey == userKey(),
+              state.connectionGeneration == OpenWearablesHealthSdkKeychain.connectionGeneration(),
+              state.syncSessionId != nil else {
             logMessage("Sync state for different user, clearing")
             clearSyncSession()
             return nil
@@ -123,6 +129,8 @@ extension OpenWearablesHealthSDK {
             userKey: userKey(),
             fullExport: fullExport,
             createdAt: Date(),
+            connectionGeneration: OpenWearablesHealthSdkKeychain.connectionGeneration(),
+            syncSessionId: UUID().uuidString,
             typeProgress: [:],
             totalSentCount: 0,
             completedTypes: [],

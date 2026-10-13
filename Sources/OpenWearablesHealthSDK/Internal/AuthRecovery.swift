@@ -139,11 +139,62 @@ extension OpenWearablesHealthSDK {
         }
     }
 
+    /// Read-only lease proof, using the existing host endpoint and its auth rate controls.
+    internal func validateDeviceLease(owner: OpenWearablesHealthSdkKeychain.ConnectionOwner,
+                                      completion: @escaping (Bool) -> Void) {
+        OpenWearablesHealthSdkKeychain.connectionLock.lock()
+        defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+        guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { completion(false); return }
+        leaseValidationLock.lock()
+        if leaseValidationGeneration == owner.generation {
+            leaseValidationCallbacks.append(completion); leaseValidationLock.unlock(); return
+        }
+        guard Date() >= leaseValidationBackoffUntil else { leaseValidationLock.unlock(); completion(false); return }
+        leaseValidationGeneration = owner.generation; leaseValidationCallbacks = [completion]
+        leaseValidationLock.unlock()
+        guard let urlString = OpenWearablesHealthSdkKeychain.getRenewalUrl(), let url = URL(string: urlString),
+              let token = OpenWearablesHealthSdkKeychain.getRenewalToken(),
+              let generation = OpenWearablesHealthSdkKeychain.deviceConnectionGeneration() else {
+            finishLeaseValidation(owner: owner, active: false, backoff: 60); return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"; request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["renewal_token": token, "validate_only": true])
+        foregroundSession.dataTask(with: request) { [weak self] data, response, error in
+            OpenWearablesHealthSdkKeychain.connectionLock.lock()
+            defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+            guard let self = self, OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            if status == 401 || status == 403 || status == 410 {
+                self.markReauthRequired(); self.invalidateConnection(); return
+            }
+            guard error == nil, (200...299).contains(status), let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                let retry = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+                self.finishLeaseValidation(owner: owner, active: false, backoff: status == 429 ? min(3600, max(60, retry ?? 900)) : 60)
+                return
+            }
+            let active = json["lease_active"] as? Bool == true && json["connection_generation"] as? String == generation &&
+                json["device_id"] as? String == self.deviceId()
+            self.finishLeaseValidation(owner: owner, active: active, backoff: active ? 0 : 60)
+        }.resume()
+    }
+    private func finishLeaseValidation(owner: OpenWearablesHealthSdkKeychain.ConnectionOwner, active: Bool, backoff: TimeInterval) {
+        leaseValidationLock.lock()
+        guard leaseValidationGeneration == owner.generation else { leaseValidationLock.unlock(); return }
+        let callbacks = leaseValidationCallbacks
+        leaseValidationCallbacks = []; leaseValidationGeneration = nil
+        leaseValidationBackoffUntil = Date().addingTimeInterval(backoff)
+        leaseValidationLock.unlock()
+        for callback in callbacks { callback(active) }
+    }
+
     // MARK: - Internal: the ladder
 
     /// Entry point for every refresh rejection. Called from `attemptTokenRefresh` while it still
     /// holds the single-flight claim, so nothing else can refresh concurrently.
-    internal func resolveRefreshRejection(presentedRefreshToken: String?, completion: @escaping (TokenRefreshResult) -> Void) {
+    internal func resolveRefreshRejection(presentedRefreshToken: String?, owner: OpenWearablesHealthSdkKeychain.ConnectionOwner, completion: @escaping (TokenRefreshResult) -> Void) {
+        guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { completion(.networkError); return }
         // 1. Did another writer (a queued path, a previous run's late response) already install a
         //    newer refresh token? Then the rejection was for a stale value and the session is fine.
         if let current = self.refreshToken, current != presentedRefreshToken {
@@ -155,8 +206,11 @@ extension OpenWearablesHealthSDK {
 
         // 2. Native renewal.
         transitionAuthState(.recovering)
-        attemptRenewal { [weak self] outcome in
+        attemptRenewal(owner: owner) { [weak self] outcome in
             guard let self = self else { completion(.networkError); return }
+            OpenWearablesHealthSdkKeychain.connectionLock.lock()
+            defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+            guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { completion(.networkError); return }
             switch outcome {
             case .renewed:
                 completion(.success)
@@ -174,7 +228,10 @@ extension OpenWearablesHealthSDK {
     }
 
     /// Exchange the renewal credential for a fresh pair. Single-flight, spaced, and bounded.
-    internal func attemptRenewal(completion: @escaping (RenewalOutcome) -> Void) {
+    internal func attemptRenewal(owner: OpenWearablesHealthSdkKeychain.ConnectionOwner, completion: @escaping (RenewalOutcome) -> Void) {
+        OpenWearablesHealthSdkKeychain.connectionLock.lock()
+        defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+        guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { completion(.transient); return }
         guard let urlString = OpenWearablesHealthSdkKeychain.getRenewalUrl(),
               let token = OpenWearablesHealthSdkKeychain.getRenewalToken(),
               let url = URL(string: urlString) else {
@@ -197,12 +254,13 @@ extension OpenWearablesHealthSDK {
         }
 
         renewalLock.lock()
-        if isRenewing {
+        if isRenewing && renewalGeneration == owner.generation {
             renewalCallbacks.append(completion)
             renewalLock.unlock()
             return
         }
         isRenewing = true
+        renewalGeneration = owner.generation
         renewalCallbacks.append(completion)
         renewalLock.unlock()
 
@@ -219,7 +277,7 @@ extension OpenWearablesHealthSDK {
             "sdk_version": OpenWearablesHealthSDK.sdkVersion
         ]
         guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
-            finishRenewal(outcome: .transient)
+            finishRenewal(owner: owner, outcome: .transient)
             return
         }
         req.httpBody = bodyData
@@ -227,10 +285,13 @@ extension OpenWearablesHealthSDK {
         logMessage("Renewing SDK credentials via host...")
         let task = foregroundSession.dataTask(with: req) { [weak self] data, response, error in
             guard let self = self else { return }
+            OpenWearablesHealthSdkKeychain.connectionLock.lock()
+            defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+            guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
 
             if let error = error {
                 self.logMessage("Renewal failed: \(error.localizedDescription)")
-                self.finishRenewal(outcome: .transient)
+                self.finishRenewal(owner: owner, outcome: .transient)
                 return
             }
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -239,7 +300,7 @@ extension OpenWearablesHealthSDK {
                 let failures = OpenWearablesHealthSdkKeychain.getRenewalFailures() + 1
                 OpenWearablesHealthSdkKeychain.setRenewalFailures(failures)
                 self.logMessage("Renewal rejected: HTTP \(status) (\(failures)x)")
-                self.finishRenewal(outcome: .rejected)
+                self.finishRenewal(owner: owner, outcome: .rejected)
                 return
             }
 
@@ -248,26 +309,27 @@ extension OpenWearablesHealthSDK {
                   let access = json["access_token"] as? String,
                   let refresh = json["refresh_token"] as? String else {
                 self.logMessage("Renewal failed: HTTP \(status)")
-                self.finishRenewal(outcome: .transient)
+                self.finishRenewal(owner: owner, outcome: .transient)
                 return
             }
 
             let persisted = OpenWearablesHealthSdkKeychain.updateTokens(accessToken: access, refreshToken: refresh)
             if !persisted {
                 self.logMessage("Renewal succeeded but the pair could not be persisted")
-                self.finishRenewal(outcome: .transient)
+                self.finishRenewal(owner: owner, outcome: .transient)
                 return
             }
             OpenWearablesHealthSdkKeychain.setRenewalFailures(0)
             self.logMessage("Renewal: HTTP \(status) - fresh pair installed")
             self.markAuthOk(via: "renewal")
-            self.finishRenewal(outcome: .renewed)
+            self.finishRenewal(owner: owner, outcome: .renewed)
         }
         task.resume()
     }
 
-    private func finishRenewal(outcome: RenewalOutcome) {
+    private func finishRenewal(owner: OpenWearablesHealthSdkKeychain.ConnectionOwner, outcome: RenewalOutcome) {
         renewalLock.lock()
+        guard renewalGeneration == owner.generation else { renewalLock.unlock(); return }
         let callbacks = renewalCallbacks
         renewalCallbacks = []
         isRenewing = false

@@ -79,10 +79,9 @@ extension OpenWearablesHealthSDK {
                 predicate: predicate,
                 limit: HKObjectQueryNoLimit,
                 sortDescriptors: nil
-            ) { _, results, _ in
-                let count = results?.count ?? 0
+            ) { _, results, error in
                 lock.lock()
-                counts[type.identifier] = count
+                if error == nil { counts[type.identifier] = results?.count ?? 0 }
                 lock.unlock()
                 group.leave()
             }
@@ -110,8 +109,12 @@ extension OpenWearablesHealthSDK {
 
         let formatter = ISO8601DateFormatter()
 
+        guard types.allSatisfy({ typeCounts[$0.identifier] != nil }) else {
+            logMessage("Historical counts unavailable; refusing a completed-empty count log")
+            completion(); return
+        }
         let dataTypeCounts: [[String: Any]] = types.map {
-            ["type": $0.identifier, "count": typeCounts[$0.identifier] ?? 0]
+            ["type": $0.identifier, "count": typeCounts[$0.identifier]!]
         }
 
         var timeRange: [String: String] = ["endDate": formatter.string(from: endDate)]
@@ -129,6 +132,8 @@ extension OpenWearablesHealthSDK {
         let body: [String: Any] = [
             "sdkVersion": OpenWearablesHealthSDK.sdkVersion,
             "provider": "apple",
+            "syncType": "historical",
+            "syncSessionId": loadSyncState()?.syncSessionId as Any? ?? NSNull(),
             "events": [startEvent, collectDeviceStateEvent()]
         ]
 
@@ -152,6 +157,8 @@ extension OpenWearablesHealthSDK {
         let body: [String: Any] = [
             "sdkVersion": OpenWearablesHealthSDK.sdkVersion,
             "provider": "apple",
+            "syncType": "historical",
+            "syncSessionId": loadSyncState()?.syncSessionId as Any? ?? NSNull(),
             "events": [endEvent, collectDeviceStateEvent()]
         ]
 
@@ -176,6 +183,9 @@ extension OpenWearablesHealthSDK {
         body: [String: Any],
         completion: @escaping () -> Void
     ) {
+        let owner = OpenWearablesHealthSdkKeychain.connectionOwner()
+        OpenWearablesHealthSdkKeychain.connectionLock.lock()
+        defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
         guard let data = try? JSONSerialization.data(withJSONObject: body) else {
             logMessage("Failed to serialize sync log")
             completion()
@@ -189,6 +199,7 @@ extension OpenWearablesHealthSDK {
         req.httpBody = data
 
         let task = foregroundSession.dataTask(with: req) { [weak self] _, response, error in
+            guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
             if let error = error {
                 self?.logMessage("Sync log error: \(error.localizedDescription)")
             } else if let httpResponse = response as? HTTPURLResponse {

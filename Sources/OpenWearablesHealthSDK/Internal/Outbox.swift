@@ -10,6 +10,10 @@ extension OpenWearablesHealthSDK {
         let payloadPath: String
         let anchorPath: String?
         let wasFullExport: Bool?
+        var connectionGeneration: String? = nil
+        var retryCount: Int? = nil
+        var nextRetryAt: Date? = nil
+        var rejectedStatus: Int? = nil
     }
 
     internal func outboxDir() -> URL {
@@ -35,6 +39,9 @@ extension OpenWearablesHealthSDK {
         wasFullExport: Bool = false,
         completion: @escaping (Bool) -> Void
     ) {
+        let owner = OpenWearablesHealthSdkKeychain.connectionOwner()
+        OpenWearablesHealthSdkKeychain.connectionLock.lock()
+        defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
         guard let data = try? JSONSerialization.data(withJSONObject: payload) else {
             self.logMessage("Failed to serialize payload")
             completion(false)
@@ -73,7 +80,8 @@ extension OpenWearablesHealthSDK {
             userKey: userKey(),
             payloadPath: payloadURL.path,
             anchorPath: anchorsURL?.path,
-            wasFullExport: wasFullExport
+            wasFullExport: wasFullExport,
+            connectionGeneration: owner.generation
         )
         let itemURL = newPath("combined_item_\(id)", ext: "json")
         if let md = try? JSONEncoder().encode(item) {
@@ -97,6 +105,9 @@ extension OpenWearablesHealthSDK {
 
         let task = foregroundSession.dataTask(with: req) { [weak self] data, response, error in
             guard let self = self else { return }
+            OpenWearablesHealthSdkKeychain.connectionLock.lock()
+            defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+            guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { completion(false); return }
             
             if let error = error {
                 let nsError = error as NSError
@@ -136,6 +147,7 @@ extension OpenWearablesHealthSDK {
                     
                     // A rejected chunk is never accepted progress. Retain retryable 429;
                     // permanent 4xx is explicitly refused without advancing its query anchor.
+                    self.recordUploadRejection(itemPath: itemURL.path, status: httpResponse.statusCode)
                     if httpResponse.statusCode == 429 {
                         self.logMessage("Upload rate limited - retaining chunk for bounded outbox retry")
                     } else if (400...499).contains(httpResponse.statusCode) {
@@ -163,10 +175,11 @@ extension OpenWearablesHealthSDK {
         wasFullExport: Bool,
         completion: @escaping (Bool) -> Void
     ) {
+        let owner = OpenWearablesHealthSdkKeychain.connectionOwner()
         if isApiKeyAuth {
             self.logMessage("Got 401 with apiKey auth")
             self.emitAuthError(statusCode: 401)
-            try? FileManager.default.removeItem(atPath: payloadPath)
+            recordUploadRejection(itemPath: itemPath, status: 401)
             completion(false)
             return
         }
@@ -175,12 +188,14 @@ extension OpenWearablesHealthSDK {
         
         self.attemptTokenRefresh { [weak self] result in
             guard let self = self else { return }
+            OpenWearablesHealthSdkKeychain.connectionLock.lock()
+            defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+            guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { completion(false); return }
             
             switch result {
             case .success:
                 guard let newCredential = self.authCredential else {
                     self.logMessage("Token refreshed but no credential available")
-                    try? FileManager.default.removeItem(atPath: payloadPath)
                     completion(false)
                     return
                 }
@@ -195,6 +210,9 @@ extension OpenWearablesHealthSDK {
                 
                 let retryTask = self.foregroundSession.dataTask(with: retryReq) { [weak self] retryData, retryResponse, retryError in
                     guard let self = self else { return }
+            OpenWearablesHealthSdkKeychain.connectionLock.lock()
+            defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+            guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { completion(false); return }
                     
                     if let retryError = retryError {
                         self.logMessage("Retry failed: \(retryError.localizedDescription)")
@@ -209,6 +227,7 @@ extension OpenWearablesHealthSDK {
                         completion(true)
                     } else {
                         let retryStatus = (retryResponse as? HTTPURLResponse)?.statusCode ?? 0
+                        self.recordUploadRejection(itemPath: itemPath, status: retryStatus)
                         self.logMessage("Retry failed: HTTP \(retryStatus)")
                         if (401...403).contains(retryStatus) {
                             self.emitAuthError(statusCode: retryStatus)
@@ -216,6 +235,7 @@ extension OpenWearablesHealthSDK {
                         completion(false)
                     }
                 }
+                guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { completion(false); return }
                 retryTask.resume()
                 
             case .authFailure:
@@ -239,6 +259,8 @@ extension OpenWearablesHealthSDK {
             return
         }
         
+        guard item.userKey == userKey(),
+              item.connectionGeneration == connectionGeneration() else { return }
         if let anchorPath = anchorPath, !anchorPath.isEmpty {
             if item.typeIdentifier == "combined" {
                 if let anchorData = try? Data(contentsOf: URL(fileURLWithPath: anchorPath)),
@@ -257,14 +279,22 @@ extension OpenWearablesHealthSDK {
             try? FileManager.default.removeItem(atPath: anchorPath)
         }
         
-        if wasFullExport {
-            let fullDoneKey = "fullDone.\(item.userKey)"
-            defaults.set(true, forKey: fullDoneKey)
-            defaults.synchronize()
-            logMessage("Marked full export complete")
-        }
+        // One accepted chunk cannot establish completion of the entire historical export.
+        // Only finalizeSyncState marks the native traversal complete; server commit is separate.
         
         try? FileManager.default.removeItem(atPath: itemPath)
+    }
+
+    internal func recordUploadRejection(itemPath: String, status: Int) {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: itemPath)),
+              var item = try? JSONDecoder().decode(OutboxItem.self, from: data),
+              item.userKey == userKey(), item.connectionGeneration == connectionGeneration() else { return }
+        if status == 429 { item.nextRetryAt = Date().addingTimeInterval(60) }
+        else if (400...499).contains(status) && status != 401 { item.rejectedStatus = status }
+        if let metadata = try? JSONEncoder().encode(item) {
+            try? metadata.write(to: URL(fileURLWithPath: itemPath), options: .atomic)
+        }
+        logMessage("Upload not accepted: HTTP \(status); cursor retained")
     }
 
     // MARK: - Clear outbox
@@ -294,6 +324,16 @@ extension OpenWearablesHealthSDK {
     /// - only one retry pass can run at a time,
     /// - items already enqueued in the background session are not enqueued again.
     internal func retryOutboxIfPossible() {
+        let owner = OpenWearablesHealthSdkKeychain.connectionOwner()
+        validateDeviceLease(owner: owner) { [weak self] active in
+            OpenWearablesHealthSdkKeychain.connectionLock.lock()
+            defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+            guard active, OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
+            self?.retryValidatedOutboxIfPossible()
+        }
+    }
+    private func retryValidatedOutboxIfPossible() {
+        let owner = OpenWearablesHealthSdkKeychain.connectionOwner()
         guard let endpoint = self.syncEndpoint, let credential = self.authCredential else { return }
         
         if isSyncInProgress {
@@ -307,13 +347,19 @@ extension OpenWearablesHealthSDK {
             return
         }
         isRetryingOutbox = true
+        outboxRetryGeneration = owner.generation
         outboxRetryLock.unlock()
         
         session.getAllTasks { [weak self] tasks in
             guard let self = self else { return }
+            OpenWearablesHealthSdkKeychain.connectionLock.lock()
+            defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+            guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
             defer {
                 self.outboxRetryLock.lock()
-                self.isRetryingOutbox = false
+                if self.outboxRetryGeneration == owner.generation {
+                    self.isRetryingOutbox = false; self.outboxRetryGeneration = nil
+                }
                 self.outboxRetryLock.unlock()
             }
             
@@ -341,11 +387,14 @@ extension OpenWearablesHealthSDK {
                 if age < Self.outboxMinRetryAge { continue }
                 
                 guard let data = try? Data(contentsOf: itemURL),
-                      let item = try? JSONDecoder().decode(OutboxItem.self, from: data) else {
+                      var item = try? JSONDecoder().decode(OutboxItem.self, from: data) else {
                     try? FileManager.default.removeItem(at: itemURL)
                     continue
                 }
                 
+                guard item.userKey == self.userKey(), item.connectionGeneration == owner.generation,
+                      item.rejectedStatus == nil, (item.retryCount ?? 0) < 6,
+                      (item.nextRetryAt ?? .distantPast) <= Date() else { continue }
                 let payloadURL = URL(fileURLWithPath: item.payloadPath)
                 guard FileManager.default.fileExists(atPath: payloadURL.path) else {
                     // Orphaned metadata without a payload - clean up
@@ -370,6 +419,10 @@ extension OpenWearablesHealthSDK {
                 req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 self.applyAuth(to: &req, credential: credential)
                 
+                item.retryCount = (item.retryCount ?? 0) + 1
+                item.nextRetryAt = Date().addingTimeInterval(min(3600, 60 * pow(2, Double(item.retryCount! - 1))))
+                guard let metadata = try? JSONEncoder().encode(item),
+                      (try? metadata.write(to: itemURL, options: .atomic)) != nil else { continue }
                 let task = self.session.uploadTask(with: req, fromFile: payloadURL)
                 task.taskDescription = [itemURL.path, payloadURL.path, item.anchorPath ?? ""].joined(separator: "|")
                 task.resume()

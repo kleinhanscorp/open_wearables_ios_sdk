@@ -221,6 +221,8 @@ extension OpenWearablesHealthSDK {
             "provider": "apple",
             "sdkVersion": OpenWearablesHealthSDK.sdkVersion,
             "syncTimestamp": dateFormatter.string(from: Date()),
+            "syncType": loadSyncState()?.fullExport == true ? "historical" : "live",
+            "syncSessionId": loadSyncState()?.fullExport == true ? (loadSyncState()?.syncSessionId as Any? ?? NSNull()) : NSNull(),
             "data": [
                 "workouts": workouts,
                 "records": records,
@@ -269,6 +271,8 @@ extension OpenWearablesHealthSDK {
             "provider": "apple",
             "sdkVersion": OpenWearablesHealthSDK.sdkVersion,
             "syncTimestamp": df.string(from: Date()),
+            "syncType": loadSyncState()?.fullExport == true ? "historical" : "live",
+            "syncSessionId": loadSyncState()?.fullExport == true ? (loadSyncState()?.syncSessionId as Any? ?? NSNull()) : NSNull(),
             "data": [
                 "workouts": workouts,
                 "records": records,

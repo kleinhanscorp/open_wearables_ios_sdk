@@ -7,6 +7,44 @@ internal class OpenWearablesHealthSdkKeychain {
     private static let service = "com.openwearables.healthsdk.tokens"
     private static let defaults = UserDefaults(suiteName: "com.openwearables.healthsdk.config") ?? .standard
 
+    internal static let connectionLock = NSRecursiveLock()
+    internal struct ConnectionOwner: Equatable {
+        let userId: String?
+        let generation: String
+    }
+    static func connectionGeneration() -> String {
+        connectionLock.lock(); defer { connectionLock.unlock() }
+        if let value = defaults.string(forKey: "connectionGeneration") { return value }
+        return invalidateConnection()
+    }
+    @discardableResult static func invalidateConnection() -> String {
+        connectionLock.lock(); defer { connectionLock.unlock() }
+        let value = UUID().uuidString
+        defaults.set(value, forKey: "connectionGeneration")
+        defaults.synchronize()
+        return value
+    }
+    static func deviceId() -> String {
+        connectionLock.lock(); defer { connectionLock.unlock() }
+        if let value = defaults.string(forKey: "deviceId") { return value }
+        let value = UUID().uuidString
+        defaults.set(value, forKey: "deviceId"); defaults.synchronize()
+        return value
+    }
+    static func deviceConnectionGeneration() -> String? { defaults.string(forKey: "deviceConnectionGeneration") }
+    static func setDeviceConnectionGeneration(_ value: String) { defaults.set(value, forKey: "deviceConnectionGeneration"); defaults.synchronize() }
+    static func connectionOwner() -> ConnectionOwner {
+        connectionLock.lock(); defer { connectionLock.unlock() }
+        return ConnectionOwner(userId: getUserId(), generation: connectionGeneration())
+    }
+    static func isCurrent(_ owner: ConnectionOwner) -> Bool {
+        return connectionOwner() == owner
+    }
+    @discardableResult static func withConnection<T>(_ owner: ConnectionOwner, _ action: () -> T) -> T? {
+        connectionLock.lock(); defer { connectionLock.unlock() }
+        return isCurrent(owner) ? action() : nil
+    }
+
     // MARK: - Keys
     private static let accessTokenKey = "accessToken"
     private static let refreshTokenKey = "refreshToken"
@@ -259,6 +297,7 @@ internal class OpenWearablesHealthSdkKeychain {
     // MARK: - Clear
 
     static func clearAll() {
+        defaults.removeObject(forKey: "deviceConnectionGeneration")
         delete(key: accessTokenKey)
         delete(key: refreshTokenKey)
         delete(key: userIdKey)

@@ -10,6 +10,13 @@ extension OpenWearablesHealthSDK {
         let payloadPath = parts.count > 1 ? parts[1] : ""
         let anchorPath = parts.count > 2 ? parts[2] : ""
 
+        OpenWearablesHealthSdkKeychain.connectionLock.lock()
+        defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+        guard let itemData = try? Data(contentsOf: URL(fileURLWithPath: itemPath)),
+              let initiatingItem = try? JSONDecoder().decode(OutboxItem.self, from: itemData),
+              initiatingItem.userKey == userKey(), initiatingItem.connectionGeneration == connectionGeneration() else { return }
+        let owner = OpenWearablesHealthSdkKeychain.connectionOwner()
+
         if backgroundDataBuffer[task.taskIdentifier] != nil {
             backgroundDataBuffer.removeValue(forKey: task.taskIdentifier)
         }
@@ -46,18 +53,21 @@ extension OpenWearablesHealthSDK {
             if isApiKeyAuth {
                 self.logMessage("Background 401 with API key - emitting auth error")
                 DispatchQueue.main.async { [weak self] in
+                    guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
                     self?.emitAuthError(statusCode: 401)
                 }
             } else {
                 self.attemptTokenRefresh { [weak self] result in
                     guard let self = self else { return }
+                    guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
                     switch result {
                     case .success:
                         self.logMessage("Token refreshed after background 401 - retrying outbox...")
                         self.retryOutboxIfPossible()
                     case .authFailure:
                         DispatchQueue.main.async { [weak self] in
-                            self?.emitAuthError(statusCode: 401)
+                            guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
+                    self?.emitAuthError(statusCode: 401)
                         }
                     case .networkError:
                         self.logMessage("Token refresh failed (network) after background 401 - will retry later")
@@ -67,22 +77,8 @@ extension OpenWearablesHealthSDK {
             return
         }
 
-        if statusCode == 429 {
-            // Keep the originating payload/anchor for the existing bounded retry pass.
-            NSLog("[OpenWearablesHealthSDK] background upload rate limited - retaining item")
-            return
-        }
+        recordUploadRejection(itemPath: itemPath, status: statusCode)
 
-        if (400...499).contains(statusCode) {
-            NSLog("[OpenWearablesHealthSDK] background upload permanently rejected (HTTP \(statusCode)) - no anchor progress")
-            if !payloadPath.isEmpty { try? FileManager.default.removeItem(atPath: payloadPath) }
-            if !anchorPath.isEmpty { try? FileManager.default.removeItem(atPath: anchorPath) }
-            if !itemPath.isEmpty { try? FileManager.default.removeItem(atPath: itemPath) }
-            return
-        }
-
-        // 5xx / no response: keep the files for a later retry pass.
-        NSLog("[OpenWearablesHealthSDK] background upload failed (HTTP \(statusCode)) - will retry later")
     }
 
     public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
