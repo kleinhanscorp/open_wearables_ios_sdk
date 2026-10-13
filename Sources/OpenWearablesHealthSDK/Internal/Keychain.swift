@@ -31,6 +31,8 @@ internal class OpenWearablesHealthSdkKeychain {
         defaults.set(value, forKey: "deviceId"); defaults.synchronize()
         return value
     }
+    static func deviceLeaseRejected() -> Bool { defaults.bool(forKey: "deviceLeaseRejected") }
+    static func setDeviceLeaseRejected(_ value: Bool) { defaults.set(value, forKey: "deviceLeaseRejected"); defaults.synchronize() }
     static func deviceConnectionGeneration() -> String? { defaults.string(forKey: "deviceConnectionGeneration") }
     static func setDeviceConnectionGeneration(_ value: String) { defaults.set(value, forKey: "deviceConnectionGeneration"); defaults.synchronize() }
     static func connectionOwner() -> ConnectionOwner {
@@ -298,6 +300,7 @@ internal class OpenWearablesHealthSdkKeychain {
 
     static func clearAll() {
         defaults.removeObject(forKey: "deviceConnectionGeneration")
+        defaults.removeObject(forKey: "deviceLeaseRejected")
         delete(key: accessTokenKey)
         delete(key: refreshTokenKey)
         delete(key: userIdKey)

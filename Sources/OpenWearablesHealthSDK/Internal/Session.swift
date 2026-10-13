@@ -17,6 +17,7 @@ struct SyncState: Codable {
     let createdAt: Date
     var connectionGeneration: String? = nil
     var syncSessionId: String? = nil
+    var queryStartDate: Date? = nil
     
     var typeProgress: [String: TypeSyncProgress]
     var totalSentCount: Int
@@ -131,6 +132,7 @@ extension OpenWearablesHealthSDK {
             createdAt: Date(),
             connectionGeneration: OpenWearablesHealthSdkKeychain.connectionGeneration(),
             syncSessionId: UUID().uuidString,
+            queryStartDate: syncStartDate(),
             typeProgress: [:],
             totalSentCount: 0,
             completedTypes: [],

@@ -336,6 +336,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         // A fresh sign-in supersedes any renewal credential and any prior verdict.
         OpenWearablesHealthSdkKeychain.clearRenewalCredential()
         resetAuthLedger()
+        OpenWearablesHealthSdkKeychain.setDeviceLeaseRejected(false)
 
         OpenWearablesHealthSdkKeychain.saveCredentials(userId: userId, accessToken: accessToken, refreshToken: refreshToken)
 
@@ -783,8 +784,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         
         if effectiveFullExport {
-            let startDate = syncStartDate()
-            let endDate = Date()
+            let startDate = loadSyncState()?.queryStartDate
+            let endDate = loadSyncState()?.createdAt ?? Date()
             countSamplesForTypes(queryableTypes, startDate: startDate, endDate: endDate) { [weak self] counts in
                 guard let self = self else { return }
             OpenWearablesHealthSdkKeychain.connectionLock.lock()
@@ -1129,7 +1130,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         syncLock.unlock()
         if cancelled { completion(false, [], nil, false); return }
         
-        let startDate = syncStartDate()
+        let startDate = loadSyncState()?.queryStartDate
         var predicate: NSPredicate? = nil
         if let olderThan = olderThan {
             predicate = HKQuery.predicateForSamples(withStart: startDate, end: olderThan, options: .strictEndDate)

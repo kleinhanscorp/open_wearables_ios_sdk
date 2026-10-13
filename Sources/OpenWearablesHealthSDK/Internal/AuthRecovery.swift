@@ -89,6 +89,7 @@ extension OpenWearablesHealthSDK {
         let iso = ISO8601DateFormatter()
         return [
             "state": authState.rawValue,
+            "deviceLeaseRejected": OpenWearablesHealthSdkKeychain.deviceLeaseRejected(),
             "lastAuthErrorAt": OpenWearablesHealthSdkKeychain.getLastAuthErrorAt().map { iso.string(from: $0) },
             "lastRecoveredAt": OpenWearablesHealthSdkKeychain.getLastRecoveredAt().map { iso.string(from: $0) },
             "hasRenewalCredential": hasRenewalCredential,
@@ -166,6 +167,7 @@ extension OpenWearablesHealthSDK {
             guard let self = self, OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
             let status = (response as? HTTPURLResponse)?.statusCode ?? 0
             if status == 401 || status == 403 || status == 410 {
+                OpenWearablesHealthSdkKeychain.setDeviceLeaseRejected(true)
                 self.markReauthRequired(); self.invalidateConnection(); return
             }
             guard error == nil, (200...299).contains(status), let data = data,
