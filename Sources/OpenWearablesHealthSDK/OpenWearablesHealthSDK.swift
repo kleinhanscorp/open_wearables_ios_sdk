@@ -1034,8 +1034,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                         completion(false, [], nil, false)
                         return
                     }
-                    self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
-                    completion(true, [], nil, true)
+                    self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - query unavailable; preserving progress")
+                    completion(false, [], nil, false)
                     return
                 }
                 
@@ -1082,8 +1082,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                         completion(false, [], nil, nil, false)
                         return
                     }
-                    self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - skipping")
-                    completion(true, [], nil, nil, true)
+                    self.logMessage("\(self.shortTypeName(type.identifier)): \(error.localizedDescription) - query unavailable; preserving progress")
+                    completion(false, [], nil, nil, false)
                     return
                 }
                 

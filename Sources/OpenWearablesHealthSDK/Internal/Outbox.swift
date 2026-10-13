@@ -104,7 +104,6 @@ extension OpenWearablesHealthSDK {
                     self.logMessage("Upload error: \(error.localizedDescription)")
                     self.markNetworkError()
                 }
-                try? FileManager.default.removeItem(atPath: payloadURL.path)
                 completion(false)
                 return
             }
@@ -134,19 +133,19 @@ extension OpenWearablesHealthSDK {
                         errorMsg += " - \(truncated)"
                     }
                     self.logMessage(errorMsg)
-                    try? FileManager.default.removeItem(atPath: payloadURL.path)
                     
-                    if (400...499).contains(httpResponse.statusCode) {
-                        self.logMessage("Skipping chunk due to \(httpResponse.statusCode) - continuing sync")
-                        completion(true)
-                    } else {
-                        completion(false)
+                    // A rejected chunk is never accepted progress. Retain retryable 429;
+                    // permanent 4xx is explicitly refused without advancing its query anchor.
+                    if httpResponse.statusCode == 429 {
+                        self.logMessage("Upload rate limited - retaining chunk for bounded outbox retry")
+                    } else if (400...499).contains(httpResponse.statusCode) {
+                        self.logMessage("Upload rejected - refusing progress (HTTP \(httpResponse.statusCode))")
                     }
+                    completion(false)
                 }
             } else {
                 self.logMessage("No HTTP response")
                 self.markNetworkError()
-                try? FileManager.default.removeItem(atPath: payloadURL.path)
                 completion(false)
             }
         }
@@ -199,7 +198,6 @@ extension OpenWearablesHealthSDK {
                     
                     if let retryError = retryError {
                         self.logMessage("Retry failed: \(retryError.localizedDescription)")
-                        try? FileManager.default.removeItem(atPath: payloadPath)
                         completion(false)
                         return
                     }
@@ -215,7 +213,6 @@ extension OpenWearablesHealthSDK {
                         if (401...403).contains(retryStatus) {
                             self.emitAuthError(statusCode: retryStatus)
                         }
-                        try? FileManager.default.removeItem(atPath: payloadPath)
                         completion(false)
                     }
                 }
@@ -224,13 +221,11 @@ extension OpenWearablesHealthSDK {
             case .authFailure:
                 self.logMessage("Token refresh rejected - auth is invalid")
                 self.emitAuthError(statusCode: 401)
-                try? FileManager.default.removeItem(atPath: payloadPath)
                 completion(false)
                 
             case .networkError:
                 self.logMessage("Token refresh failed (network) - will retry later")
                 self.markNetworkError()
-                try? FileManager.default.removeItem(atPath: payloadPath)
                 completion(false)
             }
         }

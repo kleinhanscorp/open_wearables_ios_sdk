@@ -67,8 +67,14 @@ extension OpenWearablesHealthSDK {
             return
         }
 
+        if statusCode == 429 {
+            // Keep the originating payload/anchor for the existing bounded retry pass.
+            NSLog("[OpenWearablesHealthSDK] background upload rate limited - retaining item")
+            return
+        }
+
         if (400...499).contains(statusCode) {
-            NSLog("[OpenWearablesHealthSDK] background upload rejected (HTTP \(statusCode)) - dropping item")
+            NSLog("[OpenWearablesHealthSDK] background upload permanently rejected (HTTP \(statusCode)) - no anchor progress")
             if !payloadPath.isEmpty { try? FileManager.default.removeItem(atPath: payloadPath) }
             if !anchorPath.isEmpty { try? FileManager.default.removeItem(atPath: anchorPath) }
             if !itemPath.isEmpty { try? FileManager.default.removeItem(atPath: itemPath) }
