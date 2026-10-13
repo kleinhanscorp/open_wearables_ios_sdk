@@ -85,6 +85,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     internal let renewalLock = NSLock()
     internal var renewalCallbacks: [(RenewalOutcome) -> Void] = []
     
+    private var signOutCredentialsCleared = false
     internal let leaseValidationLock = NSLock()
     internal var leaseValidationGeneration: String?
     internal var leaseValidationCallbacks: [(Bool) -> Void] = []
@@ -302,19 +303,29 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         if fresh { signIn(userId: userId, accessToken: access, refreshToken: refresh, apiKey: nil) }
         else {
             guard OpenWearablesHealthSdkKeychain.getUserId() == userId else { return nil }
-            updateTokens(accessToken: access, refreshToken: refresh)
+            updateTokens(accessToken: access, refreshToken: refresh, triggerRetry: false)
         }
-        if let url = renewalUrl, let token = renewalToken { setRenewalCredential(url: url, token: token) }
+        if let url = renewalUrl, let token = renewalToken {
+            setRenewalCredential(url: url, token: token)
+            guard OpenWearablesHealthSdkKeychain.getRenewalUrl() == url,
+                  OpenWearablesHealthSdkKeychain.getRenewalToken() == token else {
+                OpenWearablesHealthSdkKeychain.setConnectionBlocked(true); return nil
+            }
+        }
         guard OpenWearablesHealthSdkKeychain.getAccessToken() == access,
               OpenWearablesHealthSdkKeychain.getRefreshToken() == refresh else { return nil }
         OpenWearablesHealthSdkKeychain.setDeviceConnectionGeneration(deviceGeneration)
+        OpenWearablesHealthSdkKeychain.setConnectionBlocked(false)
+        retryOutboxIfPossible()
         return connectionGeneration()
     }
     public func signOutConnection(expected: String) -> Bool {
         OpenWearablesHealthSdkKeychain.connectionLock.lock()
         defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
         guard expected == connectionGeneration() else { return false }
-        signOut(); return true
+        signOut()
+        return signOutCredentialsCleared && OpenWearablesHealthSdkKeychain.getUserId() == nil &&
+            OpenWearablesHealthSdkKeychain.getAccessToken() == nil && OpenWearablesHealthSdkKeychain.getRefreshToken() == nil
     }
 
     public func signIn(userId: String, accessToken: String?, refreshToken: String?, apiKey: String?) {
@@ -330,7 +341,6 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
         
         clearSyncSession()
-        resetAllAnchors()
         clearOutbox()
 
         // A fresh sign-in supersedes any renewal credential and any prior verdict.
@@ -346,6 +356,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         }
 
         let authMode = hasTokens ? "token" : "apiKey"
+        guard OpenWearablesHealthSdkKeychain.getUserId() == userId,
+              accessToken == nil || OpenWearablesHealthSdkKeychain.getAccessToken() == accessToken,
+              refreshToken == nil || OpenWearablesHealthSdkKeychain.getRefreshToken() == refreshToken else { return }
+        resetAllAnchors() // reset the incoming identity, after verified credential installation
+        OpenWearablesHealthSdkKeychain.setConnectionBlocked(false)
         logMessage("Signed in: userId=\(userId), mode=\(authMode)")
     }
 
@@ -358,6 +373,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
 
         // Before the Keychain is wiped: tell the server this refresh token is done (fire-and-forget).
         revokeRefreshTokenBestEffort()
+        signOutCredentialsCleared = OpenWearablesHealthSdkKeychain.clearAll()
 
         cancelSync()
         stopBackgroundDelivery()
@@ -368,23 +384,23 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         resetAllAnchors()
         clearSyncSession()
         clearOutbox()
-        OpenWearablesHealthSdkKeychain.clearAll()
         
         logMessage("Sign out complete - all sync state reset")
     }
     
     /// Update tokens (e.g., after external token refresh).
     /// Gutsy fork: also lifts any `recovering` / `reauthRequired` verdict — the host has repaired us.
-    public func updateTokens(accessToken: String, refreshToken: String?) {
+    public func updateTokens(accessToken: String, refreshToken: String?, triggerRetry: Bool = true) {
         OpenWearablesHealthSdkKeychain.connectionLock.lock()
         defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
         _ = invalidateConnection()
         let persisted = OpenWearablesHealthSdkKeychain.updateTokens(accessToken: accessToken, refreshToken: refreshToken)
         logMessage(persisted ? "Tokens updated" : "Tokens updated but Keychain verification failed")
         guard persisted else { return }
+        OpenWearablesHealthSdkKeychain.setConnectionBlocked(false)
         OpenWearablesHealthSdkKeychain.setRenewalFailures(0)
         markAuthOk(via: "external")
-        retryOutboxIfPossible()
+        if triggerRetry { retryOutboxIfPossible() }
     }
     
     /// Restore a previously saved session. Returns userId if restored, nil otherwise.
@@ -539,11 +555,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     /// Get stored credentials.
     public func getStoredCredentials() -> [String: Any?] {
         return [
-            "userId": OpenWearablesHealthSdkKeychain.getUserId(),
+            "userId": OpenWearablesHealthSdkKeychain.connectionBlocked() ? nil : OpenWearablesHealthSdkKeychain.getUserId(),
             "deviceConnectionGeneration": OpenWearablesHealthSdkKeychain.deviceConnectionGeneration(),
-            "accessToken": OpenWearablesHealthSdkKeychain.getAccessToken(),
-            "refreshToken": OpenWearablesHealthSdkKeychain.getRefreshToken(),
-            "apiKey": OpenWearablesHealthSdkKeychain.getApiKey(),
+            "accessToken": OpenWearablesHealthSdkKeychain.connectionBlocked() ? nil : OpenWearablesHealthSdkKeychain.getAccessToken(),
+            "refreshToken": OpenWearablesHealthSdkKeychain.connectionBlocked() ? nil : OpenWearablesHealthSdkKeychain.getRefreshToken(),
+            "apiKey": OpenWearablesHealthSdkKeychain.connectionBlocked() ? nil : OpenWearablesHealthSdkKeychain.getApiKey(),
             "host": OpenWearablesHealthSdkKeychain.getHost(),
             "isSyncActive": OpenWearablesHealthSdkKeychain.isSyncActive(),
             "authState": authState.rawValue,
@@ -1331,7 +1347,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         foregroundSession.getAllTasks { tasks in
             OpenWearablesHealthSdkKeychain.connectionLock.lock()
             defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
-            guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
+            guard OpenWearablesHealthSdkKeychain.connectionGeneration() == owner.generation else { return }
             for task in tasks { task.cancel() }
         }
     }
@@ -1352,13 +1368,13 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         foregroundSession.getAllTasks { tasks in
             OpenWearablesHealthSdkKeychain.connectionLock.lock()
             defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
-            guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
+            guard OpenWearablesHealthSdkKeychain.connectionGeneration() == owner.generation else { return }
             for task in tasks { task.cancel() }
         }
         session.getAllTasks { tasks in
             OpenWearablesHealthSdkKeychain.connectionLock.lock()
             defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
-            guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
+            guard OpenWearablesHealthSdkKeychain.connectionGeneration() == owner.generation else { return }
             for task in tasks { task.cancel() }
         }
         

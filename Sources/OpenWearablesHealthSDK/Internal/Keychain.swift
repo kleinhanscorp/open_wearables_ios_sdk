@@ -15,15 +15,20 @@ internal class OpenWearablesHealthSdkKeychain {
     static func connectionGeneration() -> String {
         connectionLock.lock(); defer { connectionLock.unlock() }
         if let value = defaults.string(forKey: "connectionGeneration") { return value }
-        return invalidateConnection()
+        let value = UUID().uuidString
+        defaults.set(value, forKey: "connectionGeneration"); defaults.synchronize()
+        return value
     }
     @discardableResult static func invalidateConnection() -> String {
         connectionLock.lock(); defer { connectionLock.unlock() }
         let value = UUID().uuidString
         defaults.set(value, forKey: "connectionGeneration")
+        defaults.set(true, forKey: "connectionBlocked")
         defaults.synchronize()
         return value
     }
+    static func connectionBlocked() -> Bool { defaults.bool(forKey: "connectionBlocked") }
+    static func setConnectionBlocked(_ value: Bool) { defaults.set(value, forKey: "connectionBlocked"); defaults.synchronize() }
     static func deviceId() -> String {
         connectionLock.lock(); defer { connectionLock.unlock() }
         if let value = defaults.string(forKey: "deviceId") { return value }
@@ -40,7 +45,7 @@ internal class OpenWearablesHealthSdkKeychain {
         return ConnectionOwner(userId: getUserId(), generation: connectionGeneration())
     }
     static func isCurrent(_ owner: ConnectionOwner) -> Bool {
-        return connectionOwner() == owner
+        return !connectionBlocked() && connectionOwner() == owner
     }
     @discardableResult static func withConnection<T>(_ owner: ConnectionOwner, _ action: () -> T) -> T? {
         connectionLock.lock(); defer { connectionLock.unlock() }
@@ -137,7 +142,7 @@ internal class OpenWearablesHealthSdkKeychain {
     }
 
     static func hasSession() -> Bool {
-        guard getUserId() != nil else { return false }
+        guard !connectionBlocked(), getUserId() != nil else { return false }
         return getAccessToken() != nil || getApiKey() != nil
     }
 
@@ -298,14 +303,11 @@ internal class OpenWearablesHealthSdkKeychain {
 
     // MARK: - Clear
 
-    static func clearAll() {
+    @discardableResult static func clearAll() -> Bool {
+        setConnectionBlocked(true)
         defaults.removeObject(forKey: "deviceConnectionGeneration")
         defaults.removeObject(forKey: "deviceLeaseRejected")
-        delete(key: accessTokenKey)
-        delete(key: refreshTokenKey)
-        delete(key: userIdKey)
-        delete(key: apiKeyKey)
-        clearRenewalCredential()
+        let removed = [accessTokenKey, refreshTokenKey, userIdKey, apiKeyKey, renewalUrlKey, renewalTokenKey].map { delete(key: $0) }
         clearAuthState()
         defaults.removeObject(forKey: hostKey)
         defaults.removeObject(forKey: customSyncUrlKey)
@@ -313,6 +315,7 @@ internal class OpenWearablesHealthSdkKeychain {
         defaults.removeObject(forKey: trackedTypesKey)
         defaults.removeObject(forKey: syncDaysBackKey)
         defaults.synchronize()
+        return removed.allSatisfy { $0 }
     }
 
     // MARK: - Private Keychain Operations
@@ -380,13 +383,14 @@ internal class OpenWearablesHealthSdkKeychain {
         return string
     }
 
-    private static func delete(key: String) {
+    @discardableResult private static func delete(key: String) -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key
         ]
 
-        SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 }

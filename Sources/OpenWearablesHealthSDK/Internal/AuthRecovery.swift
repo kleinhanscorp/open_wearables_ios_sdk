@@ -92,9 +92,9 @@ extension OpenWearablesHealthSDK {
             "deviceLeaseRejected": OpenWearablesHealthSdkKeychain.deviceLeaseRejected(),
             "lastAuthErrorAt": OpenWearablesHealthSdkKeychain.getLastAuthErrorAt().map { iso.string(from: $0) },
             "lastRecoveredAt": OpenWearablesHealthSdkKeychain.getLastRecoveredAt().map { iso.string(from: $0) },
-            "hasRenewalCredential": hasRenewalCredential,
+            "hasRenewalCredential": !OpenWearablesHealthSdkKeychain.connectionBlocked() && hasRenewalCredential,
             "renewalFailures": OpenWearablesHealthSdkKeychain.getRenewalFailures(),
-            "accessTokenExpiresAt": accessTokenExpiry().map { iso.string(from: $0) },
+            "accessTokenExpiresAt": OpenWearablesHealthSdkKeychain.connectionBlocked() ? nil : accessTokenExpiry().map { iso.string(from: $0) },
             "hasSession": OpenWearablesHealthSdkKeychain.hasSession()
         ]
     }
@@ -111,7 +111,8 @@ extension OpenWearablesHealthSDK {
         OpenWearablesHealthSdkKeychain.connectionLock.lock()
         defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
         let owner = OpenWearablesHealthSdkKeychain.connectionOwner()
-        guard expectedGeneration == nil || expectedGeneration == owner.generation else { completion("network_error"); return }
+        guard OpenWearablesHealthSdkKeychain.isCurrent(owner),
+              expectedGeneration == nil || expectedGeneration == owner.generation else { completion("network_error"); return }
         guard userId != nil, hasAuth else {
             completion("no_session")
             return
