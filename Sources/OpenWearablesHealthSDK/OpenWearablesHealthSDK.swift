@@ -137,6 +137,11 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
     private var pendingSyncWorkItem: DispatchWorkItem?
     private let syncDebounceQueue = DispatchQueue(label: "health_sync_debounce")
     private var observerBgTask: UIBackgroundTaskIdentifier = .invalid
+    // Gutsy fork (OW-P3, #9): HealthKit observer completions waiting for the sync they triggered.
+    internal let observerCompletions = ObserverCompletionGate()
+    // Gutsy fork (OW-P3, #16 hook): the attempt record of the run that owns `isSyncing` (SyncAttempts.swift).
+    internal var currentSyncAttempt: SyncAttemptRecord?
+    internal let syncAttemptLock = NSLock()
     
     // Sync flags
     internal var isInitialSyncInProgress = false
@@ -342,6 +347,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         clearSyncSession()
         clearOutbox()
+        clearSyncAttempts()
 
         // A fresh sign-in supersedes any renewal credential and any prior verdict.
         OpenWearablesHealthSdkKeychain.clearRenewalCredential()
@@ -384,7 +390,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         resetAllAnchors()
         clearSyncSession()
         clearOutbox()
-        
+        clearSyncAttempts()
+
         logMessage("Sign out complete - all sync state reset")
     }
     
@@ -639,9 +646,12 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         self.collectAllData(fullExport: fullExport, completion: completion)
     }
     
-    internal func triggerCombinedSync() {
+    internal func triggerCombinedSync(observerCompletion: (() -> Void)? = nil) {
+        if let completion = observerCompletion { observerCompletions.add(completion) }
         if isInitialSyncInProgress {
             logMessage("Skipping - initial sync in progress")
+            // The running initial sync reads these samples; HealthKit gets its answer now.
+            observerCompletions.flush()
             return
         }
         
@@ -659,6 +669,9 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             self.syncAll(fullExport: false) {
+                // Every delivery coalesced into this run (a debounced, cancelled item hands its
+                // completions on to this one) is answered after the run, not before.
+                self.observerCompletions.flush()
                 if self.observerBgTask != .invalid {
                     UIApplication.shared.endBackgroundTask(self.observerBgTask)
                     self.observerBgTask = .invalid
@@ -679,8 +692,14 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         validateDeviceLease(owner: owner) { [weak self] active in
             OpenWearablesHealthSdkKeychain.connectionLock.lock()
             defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
-            guard let self = self, OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
-            guard active else { self.logMessage("Device lease unverified; sync remains pending"); completion(); return }
+            // Gutsy fork (OW-P3): a superseded owner still ends its caller's wait (BG task, observer).
+            guard let self = self, OpenWearablesHealthSdkKeychain.isCurrent(owner) else { completion(); return }
+            guard active else {
+                self.logMessage("Device lease unverified; sync remains pending")
+                self.recordSyncAttempt(trigger: isBackground ? "background_task" : "app", stage: "lease",
+                                       outcome: "pending", errorCode: "lease_unverified")
+                completion(); return
+            }
             self.collectValidatedAllData(fullExport: fullExport, isBackground: isBackground, completion: completion)
         }
     }
@@ -688,37 +707,44 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         let owner = OpenWearablesHealthSdkKeychain.connectionOwner()
         OpenWearablesHealthSdkKeychain.connectionLock.lock()
         defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
+        let trigger = isBackground ? "background_task" : "app"
         syncLock.lock()
         if isSyncing {
             logMessage("Sync in progress, skipping")
             syncLock.unlock()
+            recordSyncAttempt(trigger: trigger, stage: "start", outcome: "busy", errorCode: "busy")
             completion()
             return
         }
         isSyncing = true
         syncLock.unlock()
-        
+        beginSyncAttempt(trigger: trigger, typeCount: 0)
+
         guard HKHealthStore.isHealthDataAvailable() else {
             logMessage("HealthKit not available")
+            finishSyncAttempt(outcome: "terminal", errorCode: "provider_unavailable")
             finishSync()
             completion()
             return
         }
-        
+
         guard self.authCredential != nil, let endpoint = self.syncEndpoint else {
             logMessage("No auth credential or endpoint")
+            finishSyncAttempt(outcome: "terminal", errorCode: "no_credentials")
             finishSync()
             completion()
             return
         }
-        
+
         let queryableTypes = getQueryableTypes()
         guard !queryableTypes.isEmpty else {
             logMessage("No queryable types")
+            finishSyncAttempt(outcome: "terminal", errorCode: "no_tracked_types")
             finishSync()
             completion()
             return
         }
+        noteSyncAttempt { $0.typeCount = queryableTypes.count }
         
         let typeNames = queryableTypes.map { shortTypeName($0.identifier) }.joined(separator: ", ")
         logMessage("Types to sync (\(queryableTypes.count)): \(typeNames)")
@@ -793,6 +819,7 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
                 } else {
                     self.logMessage("Sync incomplete - will resume remaining types later")
                 }
+                self.finishSyncAttempt(outcome: allTypesCompleted ? "completed" : "incomplete")
                 self.fullSyncStartTime = nil
                 self.finishSync()
                 completion()
@@ -980,7 +1007,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             }
             
             let payload = self.serializeCombinedStreaming(samples: allSamples)
-            
+            self.noteSyncAttempt { $0.stage = "upload" }
+
             self.enqueueCombinedUpload(
                 payload: payload, anchors: [:], endpoint: endpoint,
                 credential: freshCredential, wasFullExport: false
@@ -990,7 +1018,8 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
             defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }
             guard OpenWearablesHealthSdkKeychain.isCurrent(owner) else { return }
                 if !sendSuccess { completion(false); return }
-                
+                self.noteSyncAttempt { $0.stage = "commit"; $0.rounds += 1; $0.sentItems += allSamples.count }
+
                 // Phase 3: Update progress for all types that had data
                 for result in withData {
                     if fullExport {
@@ -1364,7 +1393,10 @@ public final class OpenWearablesHealthSDK: NSObject, URLSessionDelegate, URLSess
         
         pendingSyncWorkItem?.cancel()
         pendingSyncWorkItem = nil
-        
+        // A cancelled sync is finished processing; HealthKit must not wait on it.
+        observerCompletions.flush()
+        finishSyncAttempt(outcome: "cancelled")
+
         foregroundSession.getAllTasks { tasks in
             OpenWearablesHealthSdkKeychain.connectionLock.lock()
             defer { OpenWearablesHealthSdkKeychain.connectionLock.unlock() }

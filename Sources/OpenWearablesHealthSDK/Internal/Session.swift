@@ -210,7 +210,8 @@ extension OpenWearablesHealthSDK {
                 "isFullExport": state.fullExport,
                 "initialExportDone": initialExportDone,
                 "isSyncing": isSyncInProgress,
-                "createdAt": ISO8601DateFormatter().string(from: state.createdAt)
+                "createdAt": ISO8601DateFormatter().string(from: state.createdAt),
+                "outbox": outboxStatus()
             ]
         } else {
             return [
@@ -220,7 +221,10 @@ extension OpenWearablesHealthSDK {
                 "isFullExport": false,
                 "initialExportDone": initialExportDone,
                 "isSyncing": isSyncInProgress,
-                "createdAt": NSNull()
+                "createdAt": NSNull(),
+                // Gutsy fork (OW-P3, #9): retained copies, drops by reason, and whether copies were
+                // dropped since the last accepted upload ("exhausted").
+                "outbox": outboxStatus()
             ]
         }
     }

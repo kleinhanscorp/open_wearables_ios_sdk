@@ -14,6 +14,11 @@ extension OpenWearablesHealthSDK {
         var retryCount: Int? = nil
         var nextRetryAt: Date? = nil
         var rejectedStatus: Int? = nil
+        // Gutsy fork (OW-P3): when the copy was written. Age is measured from here, not from the
+        // file's mtime, which every retry rewrite reset (so an item retried forever never aged out).
+        var createdAt: Date? = nil
+        /// When the copy was last handed to the background session (it may still be in flight).
+        var lastAttemptAt: Date? = nil
     }
 
     internal func outboxDir() -> URL {
@@ -81,12 +86,14 @@ extension OpenWearablesHealthSDK {
             payloadPath: payloadURL.path,
             anchorPath: anchorsURL?.path,
             wasFullExport: wasFullExport,
-            connectionGeneration: owner.generation
+            connectionGeneration: owner.generation,
+            createdAt: Date()
         )
         let itemURL = newPath("combined_item_\(id)", ext: "json")
         if let md = try? JSONEncoder().encode(item) {
             try? md.write(to: itemURL, options: Data.WritingOptions.atomic)
         }
+        enforceOutboxCaps(inFlightPayloadPaths: nil, protecting: [payloadURL.path])
 
         guard let payloadData = try? Data(contentsOf: payloadURL) else {
             self.logMessage("Failed to read payload")
@@ -115,6 +122,7 @@ extension OpenWearablesHealthSDK {
                     self.logMessage("Upload error: \(error.localizedDescription)")
                     self.markNetworkError()
                 }
+                self.noteSyncAttempt { $0.errorCode = nsError.code == NSURLErrorCancelled ? "upload_cancelled" : "upload_network" }
                 completion(false)
                 return
             }
@@ -148,6 +156,11 @@ extension OpenWearablesHealthSDK {
                     // A rejected chunk is never accepted progress. Retain retryable 429;
                     // permanent 4xx is explicitly refused without advancing its query anchor.
                     self.recordUploadRejection(itemPath: itemURL.path, status: httpResponse.statusCode)
+                    let status = httpResponse.statusCode
+                    self.noteSyncAttempt {
+                        $0.httpStatus = status
+                        $0.errorCode = status == 429 ? "upload_rate_limited" : (500...599).contains(status) ? "upload_transient" : "upload_rejected"
+                    }
                     if httpResponse.statusCode == 429 {
                         self.logMessage("Upload rate limited - retaining chunk for bounded outbox retry")
                     } else if (400...499).contains(httpResponse.statusCode) {
@@ -241,11 +254,13 @@ extension OpenWearablesHealthSDK {
             case .authFailure:
                 self.logMessage("Token refresh rejected - auth is invalid")
                 self.emitAuthError(statusCode: 401)
+                self.noteSyncAttempt { $0.httpStatus = 401; $0.errorCode = "upload_auth" }
                 completion(false)
-                
+
             case .networkError:
                 self.logMessage("Token refresh failed (network) - will retry later")
                 self.markNetworkError()
+                self.noteSyncAttempt { $0.errorCode = "upload_network" }
                 completion(false)
             }
         }
@@ -281,8 +296,9 @@ extension OpenWearablesHealthSDK {
         
         // One accepted chunk cannot establish completion of the entire historical export.
         // Only finalizeSyncState marks the native traversal complete; server commit is separate.
-        
+
         try? FileManager.default.removeItem(atPath: itemPath)
+        markOutboxDelivering()
     }
 
     internal func recordUploadRejection(itemPath: String, status: Int) {
@@ -305,18 +321,108 @@ extension OpenWearablesHealthSDK {
                 try? FileManager.default.removeItem(at: file)
             }
         }
+        // The health record goes with the copies it describes, for every member (sign-out has
+        // already forgotten whose they were).
+        for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(Self.outboxHealthPrefix) {
+            defaults.removeObject(forKey: key)
+        }
         logMessage("Cleared outbox")
     }
 
+    // MARK: - Outbox bounds and health (Gutsy fork, OW-P3 #9)
+
+    private static let outboxHealthPrefix = "outbox.health."
+    private func outboxHealthKey() -> String { Self.outboxHealthPrefix + userKey() }
+
+    internal struct OutboxEntry {
+        let itemURL: URL
+        let item: OutboxItem
+        let bytes: Int64
+    }
+
+    internal func outboxEntries() -> [OutboxEntry] {
+        guard let files = try? FileManager.default.contentsOfDirectory(at: outboxDir(), includingPropertiesForKeys: nil) else { return [] }
+        return files.filter {
+            $0.pathExtension == "json" &&
+            ($0.lastPathComponent.hasPrefix("item_") || $0.lastPathComponent.hasPrefix("combined_item_"))
+        }.compactMap { url -> OutboxEntry? in
+            guard let data = try? Data(contentsOf: url), let item = try? JSONDecoder().decode(OutboxItem.self, from: data) else { return nil }
+            let size = (try? FileManager.default.attributesOfItem(atPath: item.payloadPath)[.size] as? NSNumber)?.int64Value ?? 0
+            return OutboxEntry(itemURL: url, item: item, bytes: size)
+        }
+    }
+
+    internal func removeOutboxItem(itemURL: URL, item: OutboxItem) {
+        try? FileManager.default.removeItem(atPath: item.payloadPath)
+        if let anchorPath = item.anchorPath, !anchorPath.isEmpty { try? FileManager.default.removeItem(atPath: anchorPath) }
+        try? FileManager.default.removeItem(at: itemURL)
+    }
+
+    @discardableResult
+    private func persistOutboxItem(_ item: OutboxItem, to url: URL) -> Bool {
+        guard let data = try? JSONEncoder().encode(item) else { return false }
+        return (try? data.write(to: url, options: .atomic)) != nil
+    }
+
+    /// Pre-OW-P3 copies carry no creation time: take the file's once, then keep it in the item.
+    private func legacyCreationDate(_ url: URL) -> Date {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return (attrs?[.creationDate] as? Date) ?? (attrs?[.modificationDate] as? Date) ?? Date()
+    }
+
+    /// Count a dropped copy. Anything but another member's copy marks the outbox exhausted until the next accepted upload.
+    private func noteOutboxDrop(_ reason: String, count: Int = 1) {
+        var health = defaults.dictionary(forKey: outboxHealthKey()) ?? [:]
+        health[reason] = ((health[reason] as? Int) ?? 0) + count
+        if reason != "foreign" && health["exhaustedSince"] == nil {
+            health["exhaustedSince"] = Date().timeIntervalSince1970
+        }
+        defaults.set(health, forKey: outboxHealthKey())
+    }
+
+    private func markOutboxDelivering() {
+        guard var health = defaults.dictionary(forKey: outboxHealthKey()), health["exhaustedSince"] != nil else { return }
+        health.removeValue(forKey: "exhaustedSince")
+        defaults.set(health, forKey: outboxHealthKey())
+    }
+
+    /// Item and byte caps, oldest first. `nil` in-flight set (the enqueue path): a copy handed to the
+    /// background session within its resource timeout counts as in flight.
+    internal func enforceOutboxCaps(inFlightPayloadPaths: Set<String>?, protecting: Set<String> = [], now: Date = Date()) {
+        let entries = outboxEntries()
+        guard entries.count > OutboxPolicy.maxItems || entries.reduce(Int64(0), { $0 + $1.bytes }) > OutboxPolicy.maxBytes else { return }
+        let candidates = entries.map { entry -> OutboxPolicy.Entry in
+            let path = entry.item.payloadPath
+            let inFlight = protecting.contains(path) || (inFlightPayloadPaths?.contains(path)
+                ?? entry.item.lastAttemptAt.map { now.timeIntervalSince($0) < OutboxPolicy.inFlightWindow } ?? false)
+            return OutboxPolicy.Entry(id: entry.itemURL.path, createdAt: entry.item.createdAt ?? .distantPast, bytes: entry.bytes, inFlight: inFlight)
+        }
+        let evict = Set(OutboxPolicy.evictions(candidates))
+        guard !evict.isEmpty else { return }
+        for entry in entries where evict.contains(entry.itemURL.path) { removeOutboxItem(itemURL: entry.itemURL, item: entry.item) }
+        noteOutboxDrop("evicted", count: evict.count)
+        logMessage("Outbox: cap reached - evicted \(evict.count) oldest copy(ies); HealthKit still holds the samples")
+    }
+
+    /// Visible state for getSyncStatus: this member's retained copies and what was dropped.
+    internal func outboxStatus() -> [String: Any] {
+        let mine = outboxEntries().filter { $0.item.userKey == userKey() }
+        let health = defaults.dictionary(forKey: outboxHealthKey()) ?? [:]
+        let iso = ISO8601DateFormatter()
+        var dropped: [String: Int] = [:]
+        for reason in ["terminal", "dead", "expired", "evicted", "foreign"] { dropped[reason] = (health[reason] as? Int) ?? 0 }
+        return [
+            "pending": mine.count,
+            "bytes": mine.reduce(Int64(0)) { $0 + $1.bytes },
+            "oldestCreatedAt": mine.compactMap { $0.item.createdAt }.min().map { iso.string(from: $0) } as Any? ?? NSNull(),
+            "dropped": dropped,
+            "exhausted": health["exhaustedSince"] != nil,
+            "exhaustedSince": (health["exhaustedSince"] as? Double).map { iso.string(from: Date(timeIntervalSince1970: $0)) } as Any? ?? NSNull()
+        ]
+    }
+
     // MARK: - Retry pending items
-    
-    /// Minimum file age before an outbox item is retried (the original upload may
-    /// still be in flight).
-    private static let outboxMinRetryAge: TimeInterval = 30
-    /// Items older than this are dropped - the data is re-fetched from HealthKit by
-    /// the regular sync anyway, so there is no point in re-sending week-old batches.
-    private static let outboxMaxItemAge: TimeInterval = 7 * 24 * 3600
-    
+
     /// Retries pending outbox items through the *background* URLSession.
     /// - uploads go through the background session (survive suspension/kill),
     /// - the session is limited to one connection per host, so items go out serially,
@@ -373,62 +479,70 @@ extension OpenWearablesHealthSDK {
             
             let dir = self.outboxDir()
             guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) else { return }
-            
+
             let itemFiles = files.filter {
                 $0.pathExtension == "json" &&
                 ($0.lastPathComponent.hasPrefix("item_") || $0.lastPathComponent.hasPrefix("combined_item_"))
             }
-            
+
+            // Gutsy fork (OW-P3, #9): every retained copy gets a disposition (OutboxPolicy). Refused,
+            // out-of-retries, week-old and other members' copies are removed and counted — they used
+            // to be skipped before the age check and so stayed on disk forever.
+            let now = Date()
             var enqueued = 0
+            var justEnqueued = Set<String>()
             for itemURL in itemFiles {
-                guard let attrs = try? FileManager.default.attributesOfItem(atPath: itemURL.path),
-                      let mdate = attrs[.modificationDate] as? Date else { continue }
-                let age = Date().timeIntervalSince(mdate)
-                if age < Self.outboxMinRetryAge { continue }
-                
                 guard let data = try? Data(contentsOf: itemURL),
                       var item = try? JSONDecoder().decode(OutboxItem.self, from: data) else {
                     try? FileManager.default.removeItem(at: itemURL)
                     continue
                 }
-                
-                guard item.userKey == self.userKey(), item.connectionGeneration == owner.generation,
-                      item.rejectedStatus == nil, (item.retryCount ?? 0) < 6,
-                      (item.nextRetryAt ?? .distantPast) <= Date() else { continue }
                 let payloadURL = URL(fileURLWithPath: item.payloadPath)
                 guard FileManager.default.fileExists(atPath: payloadURL.path) else {
                     // Orphaned metadata without a payload - clean up
-                    try? FileManager.default.removeItem(at: itemURL)
+                    self.removeOutboxItem(itemURL: itemURL, item: item)
                     continue
                 }
-                
-                if age > Self.outboxMaxItemAge {
-                    self.logMessage("Outbox: dropping stale item (\(Int(age / 3600))h old)")
-                    try? FileManager.default.removeItem(at: payloadURL)
-                    if let anchorPath = item.anchorPath {
-                        try? FileManager.default.removeItem(atPath: anchorPath)
-                    }
-                    try? FileManager.default.removeItem(at: itemURL)
+                if item.createdAt == nil {
+                    item.createdAt = self.legacyCreationDate(itemURL)
+                    self.persistOutboxItem(item, to: itemURL)
+                }
+                let inFlight = inFlightPayloadPaths.contains(payloadURL.path)
+                var disposition = OutboxPolicy.disposition(item, createdAt: item.createdAt ?? now, now: now,
+                                                           userKey: self.userKey(), generation: owner.generation, inFlight: inFlight)
+                if disposition == .adopt {
+                    // Same member, an earlier generation (a host token repair bumps it): the copy is
+                    // still this member's, so it is re-homed rather than orphaned.
+                    item.connectionGeneration = owner.generation
+                    guard self.persistOutboxItem(item, to: itemURL) else { continue }
+                    disposition = OutboxPolicy.disposition(item, createdAt: item.createdAt ?? now, now: now,
+                                                           userKey: self.userKey(), generation: owner.generation, inFlight: inFlight)
+                }
+                if disposition.isDrop {
+                    self.logMessage("Outbox: dropping a \(disposition.reason) copy")
+                    self.removeOutboxItem(itemURL: itemURL, item: item)
+                    self.noteOutboxDrop(disposition.reason)
                     continue
                 }
-                
-                if inFlightPayloadPaths.contains(payloadURL.path) { continue }
-                
+                guard disposition == .replay else { continue }
+
                 var req = URLRequest(url: endpoint)
                 req.httpMethod = "POST"
                 req.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 self.applyAuth(to: &req, credential: credential)
-                
+
                 item.retryCount = (item.retryCount ?? 0) + 1
-                item.nextRetryAt = Date().addingTimeInterval(min(3600, 60 * pow(2, Double(item.retryCount! - 1))))
-                guard let metadata = try? JSONEncoder().encode(item),
-                      (try? metadata.write(to: itemURL, options: .atomic)) != nil else { continue }
+                item.nextRetryAt = now.addingTimeInterval(min(3600, 60 * pow(2, Double(item.retryCount! - 1))))
+                item.lastAttemptAt = now
+                guard self.persistOutboxItem(item, to: itemURL) else { continue }
                 let task = self.session.uploadTask(with: req, fromFile: payloadURL)
                 task.taskDescription = [itemURL.path, payloadURL.path, item.anchorPath ?? ""].joined(separator: "|")
                 task.resume()
                 enqueued += 1
+                justEnqueued.insert(payloadURL.path)
             }
-            
+            self.enforceOutboxCaps(inFlightPayloadPaths: inFlightPayloadPaths.union(justEnqueued))
+
             if enqueued > 0 {
                 self.logMessage("Outbox: enqueued \(enqueued) pending upload(s) to background session")
             }

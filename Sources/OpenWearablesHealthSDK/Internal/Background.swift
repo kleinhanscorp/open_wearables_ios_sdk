@@ -25,12 +25,17 @@ extension OpenWearablesHealthSDK {
                     return
                 }
 
-                self.triggerCombinedSync()
-                completionHandler()
+                // Gutsy fork (OW-P3, #9): HealthKit's completion fires once the sync this delivery
+                // triggered has finished (or its watchdog), not before the work has even started.
+                self.triggerCombinedSync(observerCompletion: completionHandler)
             }
             healthStore.execute(observer)
             activeObserverQueries.append(observer)
-            healthStore.enableBackgroundDelivery(for: type, frequency: .immediate) { _, _ in }
+            healthStore.enableBackgroundDelivery(for: type, frequency: .immediate) { [weak self] enabled, error in
+                if !enabled {
+                    self?.logMessage("Background delivery not enabled for \(type.identifier): \(error?.localizedDescription ?? "refused")")
+                }
+            }
         }
         logMessage("Background observers registered for \(observableTypes.count) types")
     }
